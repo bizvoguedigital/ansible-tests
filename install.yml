@@ -1,0 +1,16 @@
+---
+# Play 1: Update CentOS 7, YUM, and install Python 3
+- name: Update CentOS 7 and Install Python 3
+  hosts: servers
+  become: yes
+  tasks:
+    - name: Update YUM cache and upgrade all packages
+      yum:
+        name: '*'
+        state: latest
+        update_cache: yes
+
+    - name: Install Python 3
+      yum:
+        name: python3
+        state: present

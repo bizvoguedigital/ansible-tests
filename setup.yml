@@ -1,0 +1,173 @@
+---
+- name: Setup Apache and perform tasks
+  hosts: servers
+  become: yes
+  vars:
+    aws_region: us-east-1
+  gather_facts: false
+
+  # All Tasks
+  tasks:
+    - name: Ensure firewalld is installed
+      yum:
+        name: firewalld
+        state: present
+
+    - name: Start and enable firewalld service
+      service:
+        name: firewalld
+        state: started
+        enabled: yes
+
+    - name: Open HTTP port 80 in the firewall (CentOS 7)
+      firewalld:
+        port: 80/tcp
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Allow HTTPS from the local subnet (CentOS 7)
+      firewalld:
+        port: 443/tcp
+        permanent: yes
+        state: enabled
+        zone: public
+
+    - name: Install Apache webserver
+      yum:
+        name: httpd
+        state: present
+
+    - name: Start and enable Apache service
+      service:
+        name: httpd
+        state: started
+        enabled: yes
+
+    - name: Ensure Apache test page is reachable
+      command: curl -s http://{{ ansible_host }}/
+      register: curl_result
+      failed_when: "'If you can read this page it means that this site is working properly' not in curl_result.stdout"
+      changed_when: false
+
+    - name: Create directories for Preservica and logs
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: centos
+        group: centos
+      loop:
+        - "/home/centos/preservica"
+        - "/home/centos/preservica/logs"
+
+    - name: Copy Apache logs to /home/centos/preservica/logs
+      copy:
+        src: "/var/log/httpd/"
+        dest: "/home/centos/preservica/logs"
+        remote_src: yes
+        owner: centos
+        group: centos
+
+    - name: Create symbolic link from ~/hostfile to /etc/hosts
+      file:
+        src: "/etc/hosts"
+        dest: "/home/centos/hostfile"
+        state: link
+        owner: centos
+        group: centos
+
+    - name: Create an empty file named cron in user's home directory
+      file:
+        path: "/home/centos/cron"
+        state: touch
+        owner: centos
+        group: centos
+
+    - name: Schedule cron job to append date to cron file every 5 minutes
+      cron:
+        name: "Append date to cron file"
+        user: centos
+        minute: "*/5"
+        job: "date >> /home/centos/cron"
+
+    - name: Create a zip of the preservica folder
+      archive:
+        path: "/home/centos/preservica"
+        dest: "/home/centos/preservica.zip"
+        format: zip
+        owner: centos
+        group: centos
+    
+    # Install Python 3 starts here
+    - name: Install Software Collections release package
+      yum:
+        name: centos-release-scl
+        state: present
+
+    - name: Install Python 3 from SCL
+      yum:
+        name: rh-python38
+        state: present
+
+    - block:
+        - name: Retrieve information about all EBS volumes with the "Mount" tag
+          amazon.aws.ec2_vol_info:
+            region: "{{ aws_region }}"
+            filters:
+              "tag:Mount": "*"
+          register: vol_info
+          environment:
+            ANSIBLE_PYTHON_INTERPRETER: "/opt/rh/rh-python38/root/usr/bin/python"
+
+        - name: Set fact for the volume ID and Mount tag value of the first matched volume
+          set_fact:
+            volume_id: "{{ vol_info.volumes | selectattr('tags.Mount', 'defined') | map(attribute='id') | first }}"
+            mount_point: "{{ vol_info.volumes | selectattr('tags.Mount', 'defined') | map(attribute='tags.Mount') | first }}"
+          when: vol_info.volumes | length > 0
+
+        - name: Find the attached device name for the volume
+          amazon.aws.ec2_instance_info:
+            region: "{{ aws_region }}"
+            instance_ids:
+              - "{{ ansible_ec2_instance_id }}"
+          register: instance_info
+          environment:
+            ANSIBLE_PYTHON_INTERPRETER: "/opt/rh/rh-python38/root/usr/bin/python"
+
+        - name: Set fact for the device name of our volume
+          set_fact:
+            device_name: "{{ instance_info.instances[0].block_device_mappings | selectattr('ebs.volume_id', 'equalto', volume_id) | map(attribute='device_name') | first }}"
+          when: instance_info.instances[0].block_device_mappings | length > 0
+      environment:
+        ANSIBLE_PYTHON_INTERPRETER: "/opt/rh/rh-python38/root/usr/bin/python"
+
+    - name: Format the EBS volume to ext4 if not already formatted
+      ansible.builtin.filesystem:
+        fstype: ext4
+        dev: "{{ device_name }}"
+      when: volume_id is defined and mount_point is defined
+
+    - name: Ensure the mount directory exists
+      ansible.builtin.file:
+        path: "{{ mount_point }}"
+        state: directory
+        mode: '0755'
+      when: mount_point is defined
+
+    - name: Mount the EBS volume
+      ansible.posix.mount:
+        path: "{{ mount_point }}"
+        src: "{{ device_name }}"
+        fstype: ext4
+        opts: defaults
+        state: mounted
+        dump: 0
+        passno: 2
+      when: mount_point is defined and device_name is defined
+
+    - name: Block port 80 from the public zone
+      firewalld:
+        port: 80/tcp
+        permanent: yes
+        state: disabled
+        zone: public

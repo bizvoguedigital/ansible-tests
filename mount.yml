@@ -1,0 +1,49 @@
+# Play 2: Retrieve EBS volume information and prepare the disk
+- name: Manage EBS volume based on "Mount" tag
+  hosts: servers
+  become: yes
+  vars:
+    aws_region: your-region  # Replace with your actual AWS region, e.g., us-east-1
+  tasks:
+    - name: Retrieve information about all EBS volumes with the "Mount" tag
+      amazon.aws.ec2_vol_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Mount": "*"
+      delegate_to: localhost
+      register: vol_info
+
+    - name: Set facts for the volume ID and "Mount" tag value
+      set_fact:
+        volume_id: "{{ vol_info.volumes | json_query('[?tags.Mount].volume_id') | first }}"
+        mount_point: "{{ vol_info.volumes | json_query('[?tags.Mount].tags.Mount') | first }}"
+      when: vol_info.volumes | length > 0
+
+    - name: Find the attached device name
+      command: lsblk -no KNAME /dev/xvd{{ item | replace('vol-', '') }}
+      loop: "{{ vol_info.volumes | map(attribute='volume_id') | list }}"
+      register: device_names
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Format the EBS volume to ext4 if not already formatted
+      filesystem:
+        fstype: ext4
+        dev: "/dev/{{ device_names.results | map(attribute='stdout') | first }}"
+      when: volume_id is defined and mount_point is defined
+
+    - name: Ensure the mount directory exists
+      file:
+        path: "{{ mount_point }}"
+        state: directory
+        mode: '0755'
+
+    - name: Mount the EBS volume
+      mount:
+        path: "{{ mount_point }}"
+        src: "/dev/{{ device_names.results | map(attribute='stdout') | first }}"
+        fstype: ext4
+        opts: defaults
+        state: mounted
+        dump: 0
+        passno: 2
